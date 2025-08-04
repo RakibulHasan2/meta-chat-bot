@@ -792,12 +792,16 @@ async def paraphrase_endpoint(request: dict):
         logger.error(f"Error in paraphrase endpoint: {e}")
         raise HTTPException(status_code=500, detail="Error generating paraphrases")
 
-@api_router.get("/comments", response_model=List[CommentData])
+@api_router.get("/comments")
 async def get_comments(limit: int = 50):
     """Get recent comments with context"""
     try:
         comments = await db.comments.find().sort("timestamp", -1).limit(limit).to_list(limit)
-        return [CommentData(**comment) for comment in comments]
+        # Convert ObjectId to string and remove _id field
+        for comment in comments:
+            if '_id' in comment:
+                del comment['_id']
+        return comments
     except Exception as e:
         logger.error(f"Error getting comments: {e}")
         raise HTTPException(status_code=500, detail="Error fetching comments")
