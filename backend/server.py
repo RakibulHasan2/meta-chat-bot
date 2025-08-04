@@ -430,9 +430,12 @@ async def manual_reply(request: ReplyRequest):
 
 # Demo endpoint to test the system
 @api_router.post("/demo/comment")
-async def demo_comment(comment_text: str, page_id: str = "demo_page_id_456"):
+async def demo_comment(request: dict):
     """Demo endpoint to test comment processing"""
     try:
+        comment_text = request.get('comment_text', '')
+        page_id = request.get('page_id', 'demo_page_id_456')
+        
         mock_comment = {
             'id': f'demo_comment_{uuid.uuid4()}',
             'message': comment_text,
