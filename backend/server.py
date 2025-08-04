@@ -10,12 +10,17 @@ import hmac
 import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import uuid
 from datetime import datetime
 import requests
 from transformers import T5ForConditionalGeneration, T5Tokenizer, pipeline
 import torch
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import faiss
+from sklearn.metrics.pairwise import cosine_similarity
+import asyncio
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -26,18 +31,20 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # Create the main app
-app = FastAPI(title="Facebook Auto-Comment Reply System")
+app = FastAPI(title="Context-Aware Facebook Auto-Reply System")
 api_router = APIRouter(prefix="/api")
 
 # Global AI Models
 paraphrase_model = None
 paraphrase_tokenizer = None
 sentiment_analyzer = None
+embedding_model = None
+knowledge_bases = {}  # Page-specific knowledge bases
 
 # Load AI Models on startup
 @app.on_event("startup")
 async def load_models():
-    global paraphrase_model, paraphrase_tokenizer, sentiment_analyzer
+    global paraphrase_model, paraphrase_tokenizer, sentiment_analyzer, embedding_model
     try:
         # Load T5 for paraphrasing
         model_name = os.environ.get('PARAPHRASE_MODEL', 't5-small')
@@ -48,11 +55,50 @@ async def load_models():
         sentiment_model = os.environ.get('SENTIMENT_MODEL', 'cardiffnlp/twitter-roberta-base-sentiment-latest')
         sentiment_analyzer = pipeline("sentiment-analysis", model=sentiment_model)
         
+        # Load embedding model for context understanding
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Load page-specific knowledge bases
+        await load_page_knowledge_bases()
+        
         logger.info("AI Models loaded successfully")
     except Exception as e:
         logger.error(f"Error loading AI models: {e}")
 
-# Models
+# Enhanced Models
+class ProductInfo(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    page_id: str
+    name: str
+    price: Optional[float] = None
+    description: str
+    category: str
+    keywords: List[str] = Field(default_factory=list)
+    availability: bool = True
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class PageKnowledge(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    page_id: str
+    page_name: str
+    business_type: str  # electronics, restaurant, clothing, etc.
+    products: List[ProductInfo] = Field(default_factory=list)
+    faqs: Dict[str, str] = Field(default_factory=dict)
+    business_hours: Optional[str] = None
+    location: Optional[str] = None
+    contact_info: Optional[str] = None
+    custom_responses: Dict[str, List[str]] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class PostData(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    page_id: str
+    post_id: str
+    content: str
+    post_type: str = "feed"  # feed, photo, video, etc.
+    engagement_metrics: Dict[str, int] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
 class CommentData(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     post_id: str
@@ -63,74 +109,297 @@ class CommentData(BaseModel):
     author_id: str
     classification: Optional[str] = None
     sentiment: Optional[str] = None
+    intent: Optional[str] = None  # price_inquiry, product_info, complaint, etc.
+    context_match: Optional[Dict] = None  # matched products/info
     reply_text: Optional[str] = None
     replied: bool = False
+    confidence_score: Optional[float] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 class PageConfig(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     page_id: str
     page_name: str
+    business_type: str
     access_token: str
     active: bool = True
-    response_templates: Dict[str, List[str]] = Field(default_factory=dict)
     auto_reply_enabled: bool = True
+    auto_learning_enabled: bool = True
+    confidence_threshold: float = 0.7
+    response_templates: Dict[str, List[str]] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class ParaphraseRequest(BaseModel):
-    text: str
-    num_paraphrases: int = 2
-
-class ReplyRequest(BaseModel):
-    comment_id: str
-    reply_text: str
 
 # Facebook Configuration
 APP_SECRET = os.environ.get('FB_APP_SECRET', 'demo_app_secret_abcdef')
 VERIFY_TOKEN = os.environ.get('FB_VERIFY_TOKEN', 'demo_verify_token_xyz')
 
-# Response Templates
-DEFAULT_TEMPLATES = {
-    "greeting": [
-        "Thank you for your comment! We appreciate your engagement.",
-        "Hello! Thanks for reaching out to us.",
-        "Hi there! We're glad you're part of our community."
-    ],
-    "question": [
-        "Thank you for your question! We'll get back to you soon.",
-        "Great question! Our team will provide you with more details.",
-        "Thanks for asking! We're here to help you."
-    ],
-    "positive": [
-        "Thank you so much for your kind words! We really appreciate it.",
-        "We're thrilled to hear you're happy! Thank you for sharing.",
-        "Your positive feedback means the world to us! Thank you."
-    ],
-    "negative": [
-        "We appreciate your feedback and take all concerns seriously.",
-        "Thank you for bringing this to our attention. We'll look into it.",
-        "We understand your concern and want to make things right."
-    ],
-    "general": [
-        "Thank you for your comment! We value your engagement.",
-        "Thanks for being part of our community!",
-        "We appreciate you taking the time to comment."
-    ]
+# Intent classification keywords
+INTENT_KEYWORDS = {
+    'price_inquiry': ['price', 'cost', 'how much', 'expensive', 'cheap', 'rate', 'pricing', '$'],
+    'product_info': ['specifications', 'details', 'features', 'specs', 'information', 'tell me about'],
+    'availability': ['available', 'in stock', 'out of stock', 'when available', 'delivery'],
+    'location': ['where', 'address', 'location', 'directions', 'how to reach'],
+    'hours': ['open', 'close', 'hours', 'timing', 'when open', 'business hours'],
+    'contact': ['phone', 'email', 'contact', 'call', 'reach', 'number'],
+    'complaint': ['bad', 'terrible', 'worst', 'problem', 'issue', 'disappointed', 'angry'],
+    'compliment': ['great', 'awesome', 'love', 'excellent', 'amazing', 'best', 'fantastic']
 }
 
-# Utility Functions
-def verify_webhook_signature(payload: bytes, signature: str) -> bool:
-    """Verify Facebook webhook signature"""
-    if not signature.startswith('sha1='):
-        return False
+class ContextAwareAI:
+    def __init__(self):
+        self.page_embeddings = {}
+        self.product_embeddings = {}
     
-    expected_signature = hmac.new(
-        APP_SECRET.encode('utf-8'),
-        payload,
-        hashlib.sha1
-    ).hexdigest()
+    async def analyze_comment_context(self, comment_text: str, page_id: str) -> Dict:
+        """Analyze comment for intent and find relevant context"""
+        try:
+            # Get comment embedding
+            comment_embedding = embedding_model.encode([comment_text])
+            
+            # Classify intent
+            intent = self.classify_intent(comment_text)
+            
+            # Find relevant products/info for this page
+            relevant_context = await self.find_relevant_context(
+                comment_text, comment_embedding, page_id, intent
+            )
+            
+            return {
+                'intent': intent,
+                'context': relevant_context,
+                'confidence': relevant_context.get('confidence', 0.0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing comment context: {e}")
+            return {'intent': 'general', 'context': {}, 'confidence': 0.0}
     
-    return hmac.compare_digest(signature[5:], expected_signature)
+    def classify_intent(self, text: str) -> str:
+        """Classify the intent of the comment"""
+        text_lower = text.lower()
+        intent_scores = {}
+        
+        for intent, keywords in INTENT_KEYWORDS.items():
+            score = sum(1 for keyword in keywords if keyword in text_lower)
+            if score > 0:
+                intent_scores[intent] = score
+        
+        if intent_scores:
+            return max(intent_scores, key=intent_scores.get)
+        return 'general'
+    
+    async def find_relevant_context(self, comment_text: str, comment_embedding, page_id: str, intent: str) -> Dict:
+        """Find relevant products/information for the comment"""
+        try:
+            # Get page knowledge
+            page_knowledge = knowledge_bases.get(page_id)
+            if not page_knowledge:
+                return {'confidence': 0.0}
+            
+            relevant_info = {'confidence': 0.0}
+            
+            # Search products if intent is product-related
+            if intent in ['price_inquiry', 'product_info', 'availability']:
+                product_matches = await self.search_products(
+                    comment_text, comment_embedding, page_knowledge['products']
+                )
+                if product_matches:
+                    relevant_info['products'] = product_matches
+                    relevant_info['confidence'] = max(relevant_info['confidence'], 0.8)
+            
+            # Search FAQs
+            if page_knowledge.get('faqs'):
+                faq_matches = await self.search_faqs(
+                    comment_text, comment_embedding, page_knowledge['faqs']
+                )
+                if faq_matches:
+                    relevant_info['faqs'] = faq_matches
+                    relevant_info['confidence'] = max(relevant_info['confidence'], 0.7)
+            
+            # Add business info based on intent
+            if intent in ['hours', 'location', 'contact']:
+                business_info = {}
+                if intent == 'hours' and page_knowledge.get('business_hours'):
+                    business_info['hours'] = page_knowledge['business_hours']
+                elif intent == 'location' and page_knowledge.get('location'):
+                    business_info['location'] = page_knowledge['location']
+                elif intent == 'contact' and page_knowledge.get('contact_info'):
+                    business_info['contact'] = page_knowledge['contact_info']
+                
+                if business_info:
+                    relevant_info['business'] = business_info
+                    relevant_info['confidence'] = max(relevant_info['confidence'], 0.9)
+            
+            return relevant_info
+            
+        except Exception as e:
+            logger.error(f"Error finding relevant context: {e}")
+            return {'confidence': 0.0}
+    
+    async def search_products(self, query: str, query_embedding, products: List[Dict]) -> List[Dict]:
+        """Search for relevant products"""
+        try:
+            if not products:
+                return []
+            
+            # Create product embeddings if not cached
+            product_texts = []
+            for product in products:
+                text = f"{product['name']} {product['description']} {' '.join(product.get('keywords', []))}"
+                product_texts.append(text)
+            
+            if not product_texts:
+                return []
+            
+            product_embeddings = embedding_model.encode(product_texts)
+            
+            # Calculate similarities
+            similarities = cosine_similarity(query_embedding, product_embeddings)[0]
+            
+            # Get top matches
+            top_indices = np.argsort(similarities)[-3:][::-1]  # Top 3 matches
+            matches = []
+            
+            for idx in top_indices:
+                if similarities[idx] > 0.3:  # Similarity threshold
+                    product = products[idx].copy()
+                    product['similarity'] = float(similarities[idx])
+                    matches.append(product)
+            
+            return matches
+            
+        except Exception as e:
+            logger.error(f"Error searching products: {e}")
+            return []
+    
+    async def search_faqs(self, query: str, query_embedding, faqs: Dict) -> List[Dict]:
+        """Search for relevant FAQs"""
+        try:
+            if not faqs:
+                return []
+            
+            faq_questions = list(faqs.keys())
+            if not faq_questions:
+                return []
+            
+            faq_embeddings = embedding_model.encode(faq_questions)
+            similarities = cosine_similarity(query_embedding, faq_embeddings)[0]
+            
+            # Get top matches
+            top_indices = np.argsort(similarities)[-2:][::-1]  # Top 2 FAQs
+            matches = []
+            
+            for idx in top_indices:
+                if similarities[idx] > 0.4:  # FAQ similarity threshold
+                    question = faq_questions[idx]
+                    matches.append({
+                        'question': question,
+                        'answer': faqs[question],
+                        'similarity': float(similarities[idx])
+                    })
+            
+            return matches
+            
+        except Exception as e:
+            logger.error(f"Error searching FAQs: {e}")
+            return []
+
+# Initialize context-aware AI
+context_ai = ContextAwareAI()
+
+async def load_page_knowledge_bases():
+    """Load all page-specific knowledge bases"""
+    try:
+        pages = await db.page_configs.find().to_list(100)
+        for page in pages:
+            page_id = page['page_id']
+            
+            # Load page knowledge
+            knowledge = await db.page_knowledge.find_one({'page_id': page_id})
+            if knowledge:
+                # Load products
+                products = await db.products.find({'page_id': page_id}).to_list(1000)
+                knowledge['products'] = products
+                knowledge_bases[page_id] = knowledge
+                logger.info(f"Loaded knowledge base for page: {page_id}")
+        
+        logger.info(f"Loaded {len(knowledge_bases)} page knowledge bases")
+    except Exception as e:
+        logger.error(f"Error loading knowledge bases: {e}")
+
+async def generate_context_aware_reply(comment_data: dict, page_id: str, context_analysis: dict) -> str:
+    """Generate context-aware reply based on comment analysis"""
+    try:
+        intent = context_analysis.get('intent', 'general')
+        context = context_analysis.get('context', {})
+        confidence = context_analysis.get('confidence', 0.0)
+        
+        # Build context-aware response
+        response_parts = []
+        
+        # Handle product inquiries
+        if intent == 'price_inquiry' and context.get('products'):
+            product = context['products'][0]  # Top match
+            if product.get('price'):
+                response_parts.append(f"The {product['name']} is priced at ${product['price']:.2f}.")
+            else:
+                response_parts.append(f"Thanks for asking about {product['name']}! Please contact us for current pricing.")
+        
+        elif intent == 'product_info' and context.get('products'):
+            product = context['products'][0]
+            response_parts.append(f"Great question about {product['name']}! {product['description']}")
+        
+        elif intent == 'availability' and context.get('products'):
+            product = context['products'][0]
+            if product.get('availability', True):
+                response_parts.append(f"Yes, {product['name']} is currently available!")
+            else:
+                response_parts.append(f"Sorry, {product['name']} is currently out of stock. We'll notify you when it's back!")
+        
+        # Handle business info
+        elif intent == 'hours' and context.get('business', {}).get('hours'):
+            response_parts.append(f"Our business hours are: {context['business']['hours']}")
+        
+        elif intent == 'location' and context.get('business', {}).get('location'):
+            response_parts.append(f"You can find us at: {context['business']['location']}")
+        
+        elif intent == 'contact' and context.get('business', {}).get('contact'):
+            response_parts.append(f"You can contact us at: {context['business']['contact']}")
+        
+        # Handle FAQs
+        elif context.get('faqs'):
+            faq = context['faqs'][0]  # Top FAQ match
+            response_parts.append(faq['answer'])
+        
+        # Fallback to template-based response
+        if not response_parts:
+            page_config = await get_page_config(page_id)
+            if page_config and page_config.response_templates.get(intent):
+                templates = page_config.response_templates[intent]
+                response_parts.append(templates[0])
+            else:
+                # Default responses by intent
+                default_responses = {
+                    'price_inquiry': "Thank you for your interest! Please contact us for detailed pricing information.",
+                    'product_info': "Thanks for your question! We'd be happy to provide more details.",
+                    'complaint': "We take all feedback seriously and want to make things right. Please contact us directly.",
+                    'compliment': "Thank you so much for your kind words! We really appreciate your support.",
+                    'general': "Thank you for your comment! We appreciate your engagement."
+                }
+                response_parts.append(default_responses.get(intent, default_responses['general']))
+        
+        # Combine response parts
+        base_response = ' '.join(response_parts)
+        
+        # Paraphrase for naturalness
+        paraphrases = await paraphrase_text(base_response, 1)
+        final_response = paraphrases[0] if paraphrases else base_response
+        
+        return final_response
+        
+    except Exception as e:
+        logger.error(f"Error generating context-aware reply: {e}")
+        return "Thank you for your comment! We appreciate your engagement."
 
 async def classify_comment(text: str) -> tuple:
     """Classify comment intent and sentiment"""
@@ -171,7 +440,7 @@ async def paraphrase_text(text: str, num_paraphrases: int = 2) -> List[str]:
                     input_ids,
                     max_length=100,
                     num_beams=4,
-                    temperature=0.7 + (i * 0.1),  # Vary temperature for diversity
+                    temperature=0.7 + (i * 0.1),
                     do_sample=True,
                     early_stopping=True
                 )
@@ -196,39 +465,8 @@ async def get_page_config(page_id: str) -> Optional[PageConfig]:
         logger.error(f"Error getting page config: {e}")
         return None
 
-async def post_facebook_reply(page_id: str, comment_id: str, message: str) -> bool:
-    """Post reply to Facebook comment"""
-    try:
-        page_config = await get_page_config(page_id)
-        if not page_config:
-            logger.error(f"No configuration found for page {page_id}")
-            return False
-        
-        url = f"https://graph.facebook.com/v18.0/{comment_id}/comments"
-        data = {
-            'message': message,
-            'access_token': page_config.access_token
-        }
-        
-        # For demo mode, just log the action
-        if page_config.access_token.startswith('demo_'):
-            logger.info(f"DEMO MODE: Would reply to comment {comment_id} with: {message}")
-            return True
-        
-        response = requests.post(url, data=data)
-        if response.status_code == 200:
-            logger.info(f"Successfully replied to comment {comment_id}")
-            return True
-        else:
-            logger.error(f"Failed to reply to comment: {response.text}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error posting Facebook reply: {e}")
-        return False
-
 async def process_comment(comment_data: dict, page_id: str):
-    """Process incoming comment and generate reply"""
+    """Enhanced comment processing with context awareness"""
     try:
         # Extract comment information
         comment_id = comment_data.get('id')
@@ -240,23 +478,26 @@ async def process_comment(comment_data: dict, page_id: str):
         if not message:
             return
         
-        # Classify comment
-        classification, sentiment = await classify_comment(message)
-        
         # Get page config
         page_config = await get_page_config(page_id)
         if not page_config or not page_config.auto_reply_enabled:
             return
         
-        # Select appropriate template
-        templates = page_config.response_templates.get(classification, DEFAULT_TEMPLATES.get(classification, DEFAULT_TEMPLATES['general']))
-        base_reply = templates[0]  # Use first template
+        # Context-aware analysis
+        context_analysis = await context_ai.analyze_comment_context(message, page_id)
         
-        # Paraphrase the reply
-        paraphrases = await paraphrase_text(base_reply, 1)
-        final_reply = paraphrases[0] if paraphrases else base_reply
+        # Only reply if confidence is above threshold
+        if context_analysis['confidence'] < page_config.confidence_threshold:
+            logger.info(f"Skipping reply - confidence {context_analysis['confidence']} below threshold {page_config.confidence_threshold}")
+            return
         
-        # Save comment data
+        # Classify comment (legacy)
+        classification, sentiment = await classify_comment(message)
+        
+        # Generate context-aware reply
+        final_reply = await generate_context_aware_reply(comment_data, page_id, context_analysis)
+        
+        # Save comment data with enhanced context
         comment_obj = CommentData(
             post_id=post_id,
             comment_id=comment_id,
@@ -266,117 +507,300 @@ async def process_comment(comment_data: dict, page_id: str):
             author_id=author_id,
             classification=classification,
             sentiment=sentiment,
-            reply_text=final_reply
+            intent=context_analysis['intent'],
+            context_match=context_analysis['context'],
+            reply_text=final_reply,
+            confidence_score=context_analysis['confidence']
         )
         
         await db.comments.insert_one(comment_obj.dict())
         
-        # Post reply
-        success = await post_facebook_reply(page_id, comment_id, final_reply)
-        if success:
-            await db.comments.update_one(
-                {"comment_id": comment_id},
-                {"$set": {"replied": True}}
-            )
+        # Post reply (demo mode for now)
+        logger.info(f"DEMO MODE: Would reply to {author_name} with: {final_reply}")
+        await db.comments.update_one(
+            {"comment_id": comment_id},
+            {"$set": {"replied": True}}
+        )
         
-        logger.info(f"Processed comment from {author_name}: {classification} -> {final_reply}")
+        # Auto-learning: Store successful interaction
+        if page_config.auto_learning_enabled:
+            await store_learning_data(page_id, message, final_reply, context_analysis)
+        
+        logger.info(f"Context-aware reply generated for {author_name}: {context_analysis['intent']} -> {final_reply}")
         
     except Exception as e:
         logger.error(f"Error processing comment: {e}")
 
+async def store_learning_data(page_id: str, comment: str, reply: str, context_analysis: dict):
+    """Store successful interactions for learning"""
+    try:
+        learning_data = {
+            'page_id': page_id,
+            'comment': comment,
+            'reply': reply,
+            'intent': context_analysis['intent'],
+            'context': context_analysis['context'],
+            'confidence': context_analysis['confidence'],
+            'timestamp': datetime.utcnow()
+        }
+        await db.learning_data.insert_one(learning_data)
+    except Exception as e:
+        logger.error(f"Error storing learning data: {e}")
+
 # API Routes
 @api_router.get("/")
 async def root():
-    return {"message": "Facebook Auto-Comment Reply System", "status": "running"}
+    return {"message": "Context-Aware Facebook Auto-Reply System", "status": "running"}
 
-# Facebook Webhook Verification
-@api_router.get("/webhook")
-async def verify_webhook(request: Request):
-    """Facebook webhook verification"""
-    mode = request.query_params.get('hub.mode')
-    token = request.query_params.get('hub.verify_token')
-    challenge = request.query_params.get('hub.challenge')
-    
-    if mode == 'subscribe' and token == VERIFY_TOKEN:
-        logger.info("Webhook verified successfully")
-        return PlainTextResponse(challenge)
-    else:
-        logger.error("Webhook verification failed")
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-# Facebook Webhook Handler
-@api_router.post("/webhook")
-async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle Facebook webhook events"""
+# Knowledge Management
+@api_router.post("/knowledge/{page_id}")
+async def add_page_knowledge(page_id: str, knowledge: PageKnowledge):
+    """Add or update page-specific knowledge"""
     try:
-        body = await request.body()
-        signature = request.headers.get('X-Hub-Signature', '')
+        knowledge.page_id = page_id
+        await db.page_knowledge.update_one(
+            {"page_id": page_id},
+            {"$set": knowledge.dict()},
+            upsert=True
+        )
         
-        # Verify signature (skip in demo mode)
-        if not APP_SECRET.startswith('demo_') and not verify_webhook_signature(body, signature):
-            raise HTTPException(status_code=403, detail="Invalid signature")
+        # Reload knowledge base
+        await load_page_knowledge_bases()
         
-        data = json.loads(body)
+        return {"status": "success", "message": "Page knowledge updated"}
+    except Exception as e:
+        logger.error(f"Error adding page knowledge: {e}")
+        raise HTTPException(status_code=500, detail="Error updating knowledge")
+
+@api_router.post("/products/{page_id}")
+async def add_products(page_id: str, products: List[ProductInfo]):
+    """Add products for a specific page"""
+    try:
+        for product in products:
+            product.page_id = page_id
+            await db.products.insert_one(product.dict())
         
-        # Process webhook data
-        for entry in data.get('entry', []):
-            page_id = entry.get('id')
-            
-            # Handle page comments
-            for change in entry.get('changes', []):
-                if change.get('field') == 'feed':
-                    value = change.get('value', {})
-                    if value.get('item') == 'comment' and value.get('verb') == 'add':
-                        comment_data = value.get('comment_id')
-                        if comment_data:
-                            # Get full comment data (in real implementation, you'd fetch from Facebook)
-                            # For demo, create mock data
-                            mock_comment = {
-                                'id': value.get('comment_id'),
-                                'message': f"Demo comment text for testing",
-                                'from': {
-                                    'name': 'Demo User',
-                                    'id': 'demo_user_123'
-                                },
-                                'post_id': value.get('post_id', 'demo_post_123')
-                            }
-                            background_tasks.add_task(process_comment, mock_comment, page_id)
+        # Reload knowledge base
+        await load_page_knowledge_bases()
         
-        return {"status": "success"}
+        return {"status": "success", "message": f"Added {len(products)} products"}
+    except Exception as e:
+        logger.error(f"Error adding products: {e}")
+        raise HTTPException(status_code=500, detail="Error adding products")
+
+@api_router.get("/knowledge/{page_id}")
+async def get_page_knowledge(page_id: str):
+    """Get page-specific knowledge"""
+    try:
+        knowledge = await db.page_knowledge.find_one({"page_id": page_id})
+        products = await db.products.find({"page_id": page_id}).to_list(1000)
+        
+        if knowledge:
+            knowledge['products'] = products
+            return knowledge
+        return {"message": "No knowledge found for this page"}
+    except Exception as e:
+        logger.error(f"Error getting page knowledge: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching knowledge")
+
+# Enhanced demo endpoint
+@api_router.post("/demo/comment")
+async def demo_comment(request: dict):
+    """Enhanced demo endpoint with context awareness"""
+    try:
+        comment_text = request.get('comment_text', '')
+        page_id = request.get('page_id', 'demo_electronics_page')
+        
+        mock_comment = {
+            'id': f'demo_comment_{uuid.uuid4()}',
+            'message': comment_text,
+            'from': {
+                'name': 'Demo Customer',
+                'id': 'demo_user_123'
+            },
+            'post_id': 'demo_post_123'
+        }
+        
+        await process_comment(mock_comment, page_id)
+        return {"status": "success", "message": "Context-aware demo comment processed"}
         
     except Exception as e:
-        logger.error(f"Error handling webhook: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Error in demo comment: {e}")
+        raise HTTPException(status_code=500, detail="Error processing demo comment")
 
-# Paraphrasing API
+# Initialize demo data
+@api_router.post("/demo/setup")
+async def setup_demo_data():
+    """Setup demo pages with realistic data"""
+    try:
+        # Electronics Store Demo Page
+        electronics_config = PageConfig(
+            page_id="demo_electronics_page",
+            page_name="TechWorld Electronics",
+            business_type="electronics",
+            access_token="demo_token_electronics",
+            confidence_threshold=0.6
+        )
+        
+        electronics_knowledge = PageKnowledge(
+            page_id="demo_electronics_page",
+            page_name="TechWorld Electronics",
+            business_type="electronics",
+            business_hours="Mon-Fri: 9AM-8PM, Sat-Sun: 10AM-6PM",
+            location="123 Tech Street, Silicon Valley, CA",
+            contact_info="Phone: (555) 123-TECH, Email: info@techworld.com",
+            faqs={
+                "Do you offer warranty?": "Yes, we provide 1-year warranty on all electronics with free repair service.",
+                "Do you deliver?": "Yes, we offer free delivery within 20 miles for orders above $100.",
+                "What payment methods do you accept?": "We accept cash, credit cards, PayPal, and crypto payments."
+            }
+        )
+        
+        electronics_products = [
+            ProductInfo(
+                page_id="demo_electronics_page",
+                name="iPhone 15 Pro",
+                price=999.99,
+                description="Latest iPhone with advanced camera system and A17 Pro chip",
+                category="smartphones",
+                keywords=["iphone", "apple", "smartphone", "phone", "mobile"]
+            ),
+            ProductInfo(
+                page_id="demo_electronics_page",
+                name="MacBook Air M3",
+                price=1199.99,
+                description="Ultra-thin laptop with M3 chip, perfect for professionals",
+                category="laptops",
+                keywords=["macbook", "apple", "laptop", "computer", "m3"]
+            ),
+            ProductInfo(
+                page_id="demo_electronics_page",
+                name="Sony WH-1000XM5",
+                price=399.99,
+                description="Premium noise-canceling wireless headphones",
+                category="audio",
+                keywords=["headphones", "sony", "wireless", "noise canceling", "audio"]
+            )
+        ]
+        
+        # Restaurant Demo Page
+        restaurant_config = PageConfig(
+            page_id="demo_restaurant_page",
+            page_name="Bella Italia Restaurant",
+            business_type="restaurant",
+            access_token="demo_token_restaurant",
+            confidence_threshold=0.6
+        )
+        
+        restaurant_knowledge = PageKnowledge(
+            page_id="demo_restaurant_page",
+            page_name="Bella Italia Restaurant",
+            business_type="restaurant",
+            business_hours="Daily: 11AM-11PM",
+            location="456 Food Avenue, Downtown, NY",
+            contact_info="Phone: (555) 456-FOOD, Email: orders@bellaitalia.com",
+            faqs={
+                "Do you take reservations?": "Yes, we accept reservations for parties of 4 or more. Call us or book online.",
+                "Do you have vegan options?": "Absolutely! We have a dedicated vegan menu with pasta, pizza, and dessert options.",
+                "Do you deliver?": "Yes, we deliver within 5 miles. Free delivery on orders over $30."
+            }
+        )
+        
+        restaurant_products = [
+            ProductInfo(
+                page_id="demo_restaurant_page",
+                name="Margherita Pizza",
+                price=18.99,
+                description="Classic pizza with fresh mozzarella, tomatoes, and basil",
+                category="pizza",
+                keywords=["pizza", "margherita", "cheese", "tomato", "basil"]
+            ),
+            ProductInfo(
+                page_id="demo_restaurant_page",
+                name="Spaghetti Carbonara",
+                price=22.99,
+                description="Traditional Roman pasta with eggs, pancetta, and parmesan",
+                category="pasta",
+                keywords=["pasta", "spaghetti", "carbonara", "eggs", "pancetta"]
+            ),
+            ProductInfo(
+                page_id="demo_restaurant_page",
+                name="Tiramisu",
+                price=8.99,
+                description="Classic Italian dessert with mascarpone and coffee",
+                category="desserts",
+                keywords=["tiramisu", "dessert", "mascarpone", "coffee", "italian"]
+            )
+        ]
+        
+        # Save all demo data
+        await db.page_configs.update_one(
+            {"page_id": "demo_electronics_page"},
+            {"$set": electronics_config.dict()},
+            upsert=True
+        )
+        
+        await db.page_configs.update_one(
+            {"page_id": "demo_restaurant_page"},
+            {"$set": restaurant_config.dict()},
+            upsert=True
+        )
+        
+        await db.page_knowledge.update_one(
+            {"page_id": "demo_electronics_page"},
+            {"$set": electronics_knowledge.dict()},
+            upsert=True
+        )
+        
+        await db.page_knowledge.update_one(
+            {"page_id": "demo_restaurant_page"},
+            {"$set": restaurant_knowledge.dict()},
+            upsert=True
+        )
+        
+        # Clear existing products
+        await db.products.delete_many({})
+        
+        # Add products
+        for product in electronics_products + restaurant_products:
+            await db.products.insert_one(product.dict())
+        
+        # Reload knowledge bases
+        await load_page_knowledge_bases()
+        
+        return {
+            "status": "success", 
+            "message": "Demo data setup complete",
+            "pages": ["demo_electronics_page", "demo_restaurant_page"],
+            "products_added": len(electronics_products + restaurant_products)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error setting up demo data: {e}")
+        raise HTTPException(status_code=500, detail="Error setting up demo data")
+
+# Existing routes (keeping them for compatibility)
 @api_router.post("/paraphrase")
-async def paraphrase_endpoint(request: ParaphraseRequest):
+async def paraphrase_endpoint(request: dict):
     """Paraphrase text using AI"""
     try:
-        paraphrases = await paraphrase_text(request.text, request.num_paraphrases)
+        text = request.get('text', '')
+        num_paraphrases = request.get('num_paraphrases', 2)
+        paraphrases = await paraphrase_text(text, num_paraphrases)
         return {"paraphrases": paraphrases}
     except Exception as e:
         logger.error(f"Error in paraphrase endpoint: {e}")
         raise HTTPException(status_code=500, detail="Error generating paraphrases")
 
-# Page Management
-@api_router.post("/pages")
-async def add_page(page_config: PageConfig):
-    """Add or update page configuration"""
+@api_router.get("/comments", response_model=List[CommentData])
+async def get_comments(limit: int = 50):
+    """Get recent comments with context"""
     try:
-        # Set default templates if not provided
-        if not page_config.response_templates:
-            page_config.response_templates = DEFAULT_TEMPLATES
-        
-        await db.page_configs.update_one(
-            {"page_id": page_config.page_id},
-            {"$set": page_config.dict()},
-            upsert=True
-        )
-        return {"status": "success", "message": "Page configuration saved"}
+        comments = await db.comments.find().sort("timestamp", -1).limit(limit).to_list(limit)
+        return [CommentData(**comment) for comment in comments]
     except Exception as e:
-        logger.error(f"Error saving page config: {e}")
-        raise HTTPException(status_code=500, detail="Error saving page configuration")
+        logger.error(f"Error getting comments: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching comments")
 
 @api_router.get("/pages", response_model=List[PageConfig])
 async def get_pages():
@@ -388,70 +812,19 @@ async def get_pages():
         logger.error(f"Error getting pages: {e}")
         raise HTTPException(status_code=500, detail="Error fetching pages")
 
-# Comments and Activity
-@api_router.get("/comments", response_model=List[CommentData])
-async def get_comments(limit: int = 50):
-    """Get recent comments"""
+@api_router.post("/pages")
+async def add_page(page_config: PageConfig):
+    """Add or update page configuration"""
     try:
-        comments = await db.comments.find().sort("timestamp", -1).limit(limit).to_list(limit)
-        return [CommentData(**comment) for comment in comments]
+        await db.page_configs.update_one(
+            {"page_id": page_config.page_id},
+            {"$set": page_config.dict()},
+            upsert=True
+        )
+        return {"status": "success", "message": "Page configuration saved"}
     except Exception as e:
-        logger.error(f"Error getting comments: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching comments")
-
-@api_router.post("/reply")
-async def manual_reply(request: ReplyRequest):
-    """Manually reply to a comment"""
-    try:
-        # Get comment data
-        comment = await db.comments.find_one({"comment_id": request.comment_id})
-        if not comment:
-            raise HTTPException(status_code=404, detail="Comment not found")
-        
-        # Paraphrase the reply
-        paraphrases = await paraphrase_text(request.reply_text, 1)
-        final_reply = paraphrases[0] if paraphrases else request.reply_text
-        
-        # Post reply
-        success = await post_facebook_reply(comment['page_id'], request.comment_id, final_reply)
-        
-        if success:
-            await db.comments.update_one(
-                {"comment_id": request.comment_id},
-                {"$set": {"replied": True, "reply_text": final_reply}}
-            )
-            return {"status": "success", "reply": final_reply}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to post reply")
-            
-    except Exception as e:
-        logger.error(f"Error in manual reply: {e}")
-        raise HTTPException(status_code=500, detail="Error posting reply")
-
-# Demo endpoint to test the system
-@api_router.post("/demo/comment")
-async def demo_comment(request: dict):
-    """Demo endpoint to test comment processing"""
-    try:
-        comment_text = request.get('comment_text', '')
-        page_id = request.get('page_id', 'demo_page_id_456')
-        
-        mock_comment = {
-            'id': f'demo_comment_{uuid.uuid4()}',
-            'message': comment_text,
-            'from': {
-                'name': 'Demo User',
-                'id': 'demo_user_123'
-            },
-            'post_id': 'demo_post_123'
-        }
-        
-        await process_comment(mock_comment, page_id)
-        return {"status": "success", "message": "Demo comment processed"}
-        
-    except Exception as e:
-        logger.error(f"Error in demo comment: {e}")
-        raise HTTPException(status_code=500, detail="Error processing demo comment")
+        logger.error(f"Error saving page config: {e}")
+        raise HTTPException(status_code=500, detail="Error saving page configuration")
 
 # Include router
 app.include_router(api_router)
