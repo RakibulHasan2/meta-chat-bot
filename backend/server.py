@@ -806,12 +806,16 @@ async def get_comments(limit: int = 50):
         logger.error(f"Error getting comments: {e}")
         raise HTTPException(status_code=500, detail="Error fetching comments")
 
-@api_router.get("/pages", response_model=List[PageConfig])
+@api_router.get("/pages")
 async def get_pages():
     """Get all page configurations"""
     try:
         pages = await db.page_configs.find().to_list(1000)
-        return [PageConfig(**page) for page in pages]
+        # Convert ObjectId to string and remove _id field
+        for page in pages:
+            if '_id' in page:
+                del page['_id']
+        return pages
     except Exception as e:
         logger.error(f"Error getting pages: {e}")
         raise HTTPException(status_code=500, detail="Error fetching pages")
