@@ -28,5 +28,3 @@ torch>=2.0.0
 sentencepiece>=0.1.99
 accelerate>=0.20.0
 scipy>=1.10.0
-hashlib
-hmac
